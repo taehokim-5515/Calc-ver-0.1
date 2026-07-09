@@ -15,6 +15,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# 발주 정보 입력 컬럼 정의
+ORDER_INFO_COLUMNS = ['부가세 구분', '제품 구분', '업체명', '단량(KG)', '단가(원)', '담당자 이메일']
+
 def is_weekend(date):
     """주말인지 확인하는 함수 (토요일: 5, 일요일: 6)"""
     return date.weekday() >= 5
@@ -101,17 +104,14 @@ def display_calendar(results_data):
 
                             # 스타일 적용
                             if has_schedule:
-                                # 입고 일정이 있는 날
                                 bg_color = "#FFE6E6"  # 연한 빨간색
                                 border_color = "#FF4444"
                                 text_color = "#000000"
                             elif is_weekend_day:
-                                # 주말
                                 bg_color = "#F0F0F0"  # 연한 회색
                                 border_color = "#CCCCCC"
                                 text_color = "#666666"
                             else:
-                                # 평일
                                 bg_color = "#FFFFFF"  # 흰색
                                 border_color = "#DDDDDD"
                                 text_color = "#000000"
@@ -134,7 +134,6 @@ def display_calendar(results_data):
                             # 입고 품목이 있는 경우 추가
                             if has_schedule:
                                 for item_name in item_dates[date_str]:
-                                    # 품목명이 너무 길면 줄임
                                     display_name = item_name if len(item_name) <= 8 else item_name[:8] + "..."
                                     cell_content += f"<div style='background-color: #FF6666; color: white; padding: 1px 3px; margin: 1px 0; border-radius: 3px; font-size: 10px;'>{display_name}</div>"
 
@@ -179,7 +178,6 @@ def display_calendar(results_data):
         # 입고 일정 상세 정보
         st.markdown("### 📋 입고 일정 상세")
 
-        # 날짜별로 정렬하여 표시
         sorted_dates = sorted(item_dates.items())
 
         for date_str, items in sorted_dates:
@@ -194,7 +192,6 @@ def display_calendar(results_data):
         st.error(f"캘린더 표시 중 오류 발생: {str(e)}")
         st.info("입고 일정을 목록 형태로 표시합니다.")
 
-        # 대안: 간단한 목록 형태로 표시
         all_purchase_dates = []
         for item in results_data:
             if item['입고 필요일'] != '입고 필요 없음':
@@ -332,16 +329,13 @@ def calculate_monthly_purchase(results_data, df):
         item_code = row['원료코드명']
         item_name = row['원료명']
 
-        # 해당 품목의 결과 데이터 찾기
         item_result = next((r for r in results_data if r['품목코드'] == item_code), None)
 
         if item_result and item_result['입고 필요일'] != '입고 필요 없음':
-            # 입고일, 도달시 재고량, 입고후 재고량을 가져옴
             purchase_dates = item_result['입고 필요일'].split(', ')
             stock_before = [float(x) for x in item_result['도달시 재고량'].split(', ')]
             stock_after = [float(x) for x in item_result['입고후 재고량'].split(', ')]
 
-            # 각 입고시점의 실제 구매량 계산
             actual_purchases = [after - before for before, after in zip(stock_before, stock_after)]
 
             monthly_counts = {}
@@ -362,13 +356,11 @@ def calculate_monthly_purchase(results_data, df):
                 monthly_counts[display_key]['count'] += 1
                 monthly_counts[display_key]['amount'] += purchase_amount
 
-            # 품목별 데이터 생성
             item_data = {
                 '품목코드': item_code,
                 '품목명': item_name
             }
 
-            # 정렬된 순서대로 데이터 추가
             sorted_months = sorted(monthly_counts.items(),
                                  key=lambda x: x[1]['sort_key'])
 
@@ -383,36 +375,82 @@ def calculate_monthly_purchase(results_data, df):
 
     return pd.DataFrame(monthly_data)
 
-def create_purchase_order_df(results_data, df):
-    """계산 결과를 발주서 생성창 규격으로 변환하는 함수
-    입고일·품목명·입고량(KG)은 계산 결과에서, 나머지는 업로드 Excel의 발주 정보에서 가져옴
+def build_order_info_base(df, prefill_df=None):
+    """업로드된 재고 데이터의 품목 목록으로 발주 정보 입력용 기본 표를 생성하는 함수
+    prefill_df(기준정보 파일)가 있으면 품목코드 기준으로 미리 채움
+    """
+    base = pd.DataFrame({
+        '원료코드명': df['원료코드명'].astype(str),
+        '원료명': df['원료명'].astype(str),
+    })
+    base['부가세 구분'] = ''
+    base['제품 구분'] = ''
+    base['업체명'] = ''
+    base['단량(KG)'] = None
+    base['단가(원)'] = None
+    base['담당자 이메일'] = ''
+
+    if prefill_df is not None:
+        pre = prefill_df.copy()
+        # 코드 열 이름 유연하게 인식 (품목코드 또는 원료코드명)
+        code_col = next((c for c in ['원료코드명', '품목코드'] if c in pre.columns), None)
+        if code_col:
+            pre[code_col] = pre[code_col].astype(str).str.strip()
+            pre = pre.drop_duplicates(subset=[code_col], keep='first').set_index(code_col)
+
+            for col in ORDER_INFO_COLUMNS:
+                if col in pre.columns:
+                    mapped = base['원료코드명'].str.strip().map(pre[col])
+                    if col in ['단량(KG)', '단가(원)']:
+                        base[col] = pd.to_numeric(mapped, errors='coerce')
+                    else:
+                        base[col] = mapped.fillna('').astype(str).str.strip().replace('미입력', '')
+        else:
+            st.warning("⚠️ 기준정보 파일에 '품목코드' 또는 '원료코드명' 열이 없어 미리 채우기를 건너뜁니다.")
+
+    return base
+
+def create_purchase_order_df(results_data, df, order_info_df):
+    """계산 결과 + 입력받은 발주 정보를 발주서 생성창 규격으로 변환하는 함수
+    입고일·품목명·입고량(KG)은 계산 결과에서, 나머지는 발주 정보 입력값에서 가져옴
     총액(원) = 입고량(KG) × 단가(원)  ※ 단가는 KG당 단가 기준
     """
     order_columns = ['입고일', '품목명', '부가세 구분', '제품 구분', '업체명',
                      '단량(KG)', '입고량(KG)', '단가(원)', '총액(원)', '담당자 이메일']
+
+    # 품목코드 → 발주 정보 조회용 딕셔너리
+    info = order_info_df.copy()
+    info['원료코드명'] = info['원료코드명'].astype(str).str.strip()
+    info_lookup = info.set_index('원료코드명').to_dict('index')
+
     order_rows = []
 
     for _, row in df.iterrows():
-        item_result = next((r for r in results_data if r['품목코드'] == row['원료코드명']), None)
+        item_code = str(row['원료코드명']).strip()
+        item_result = next((r for r in results_data if str(r['품목코드']).strip() == item_code), None)
         if not item_result or item_result['입고 필요일'] == '입고 필요 없음':
             continue
 
+        item_info = info_lookup.get(item_code, {})
         purchase_amount = float(row['1회 구매량'])  # 입고량(KG)
-        unit_price = pd.to_numeric(row.get('단가(원)', None), errors='coerce')
+        unit_price = pd.to_numeric(item_info.get('단가(원)'), errors='coerce')
         total_price = round(purchase_amount * unit_price) if pd.notna(unit_price) else ''
+
+        def clean(value):
+            return '' if pd.isna(value) else str(value).strip()
 
         for date_str in item_result['입고 필요일'].split(', '):
             order_rows.append({
                 '입고일': date_str,
                 '품목명': row['원료명'],
-                '부가세 구분': '' if pd.isna(row.get('부가세 구분')) else row.get('부가세 구분'),
-                '제품 구분': '' if pd.isna(row.get('제품 구분')) else row.get('제품 구분'),
-                '업체명': '' if pd.isna(row.get('업체명')) else row.get('업체명'),
-                '단량(KG)': '' if pd.isna(row.get('단량(KG)')) else row.get('단량(KG)'),
+                '부가세 구분': clean(item_info.get('부가세 구분')),
+                '제품 구분': clean(item_info.get('제품 구분')),
+                '업체명': clean(item_info.get('업체명')),
+                '단량(KG)': item_info.get('단량(KG)') if pd.notna(item_info.get('단량(KG)')) else '',
                 '입고량(KG)': purchase_amount,
                 '단가(원)': unit_price if pd.notna(unit_price) else '',
                 '총액(원)': total_price,
-                '담당자 이메일': '' if pd.isna(row.get('담당자 이메일')) else str(row.get('담당자 이메일')).strip(),
+                '담당자 이메일': clean(item_info.get('담당자 이메일')),
             })
 
     if not order_rows:
@@ -423,7 +461,6 @@ def create_purchase_order_df(results_data, df):
 def create_calendar_sheet_safe(writer, results_data):
     """달력 형식으로 입고 일정을 표시하는 함수 (안전한 버전)"""
     try:
-        # 모든 입고 날짜 수집
         all_dates = []
         item_dates = {}
 
@@ -441,42 +478,34 @@ def create_calendar_sheet_safe(writer, results_data):
                         continue
 
         if not all_dates:
-            # 달력 시트 생성하되 메시지만 표시
             workbook = writer.book
             calendar_sheet = workbook.create_sheet('입고일정달력')
             calendar_sheet.cell(row=1, column=1, value="입고 일정이 없습니다.")
             return
 
-        # 달력에 표시할 기간 결정
         start_date = min(all_dates)
         end_date = max(all_dates)
 
-        # 각 월별로 달력 생성
         current_date = start_date.replace(day=1)
         end_month = end_date.replace(day=1)
 
-        # 엑셀 워크북 가져오기
         workbook = writer.book
         calendar_sheet = workbook.create_sheet('입고일정달력')
 
-        # 스타일 설정
         header_fill = PatternFill(start_color='CCE5FF', end_color='CCE5FF', fill_type='solid')
         weekend_fill = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')
         border = Border(left=Side(style='thin'), right=Side(style='thin'),
                        top=Side(style='thin'), bottom=Side(style='thin'))
 
-        # 현재 행 위치
         current_row = 1
 
         while current_date <= end_month:
-            # 월 제목 추가
             month_title = current_date.strftime('%Y년 %m월')
             calendar_sheet.merge_cells(f'A{current_row}:G{current_row}')
             title_cell = calendar_sheet.cell(row=current_row, column=1, value=month_title)
             title_cell.font = Font(bold=True, size=12)
             title_cell.alignment = Alignment(horizontal='center')
 
-            # 요일 헤더 추가
             days = ['월', '화', '수', '목', '금', '토', '일']
             header_row = current_row + 1
             for col, day in enumerate(days, 1):
@@ -486,7 +515,6 @@ def create_calendar_sheet_safe(writer, results_data):
                 cell.alignment = Alignment(horizontal='center')
                 calendar_sheet.column_dimensions[get_column_letter(col)].width = 15
 
-            # 달력 날짜 채우기
             cal = calendar.monthcalendar(current_date.year, current_date.month)
             for week_idx, week in enumerate(cal):
                 row = current_row + 2 + week_idx
@@ -499,27 +527,22 @@ def create_calendar_sheet_safe(writer, results_data):
                         date_str = f"{current_date.year}-{current_date.month:02d}-{day:02d}"
                         cell_text = str(day)
 
-                        # 입고 품목이 있는 경우 추가
                         if date_str in item_dates:
                             cell_text += "\n" + "\n".join(item_dates[date_str])
 
                         cell.value = cell_text
 
-                        # 주말인 경우 배경색 지정
                         if day_idx >= 5:
                             cell.fill = weekend_fill
 
-            # 다음 달력을 위한 간격 추가
             current_row += len(cal) + 4
             current_date = (current_date + timedelta(days=32)).replace(day=1)
 
-        # 전체 셀 높이 조정
         for row_num in range(1, current_row):
             calendar_sheet.row_dimensions[row_num].height = 60
 
     except Exception as e:
         st.warning(f"달력 생성 중 오류: {str(e)}")
-        # 기본 메시지 시트라도 생성
         workbook = writer.book
         calendar_sheet = workbook.create_sheet('입고일정달력')
         calendar_sheet.cell(row=1, column=1, value=f"달력 생성 중 오류 발생: {str(e)}")
@@ -545,7 +568,6 @@ def create_excel_file(results_data, monthly_df, po_df):
             if not monthly_df.empty:
                 monthly_df.to_excel(writer, sheet_name='월별구매량', index=False)
             else:
-                # 빈 데이터프레임이라도 시트는 생성
                 pd.DataFrame({'메시지': ['계산 기간 내 구매가 필요한 품목이 없습니다.']}).to_excel(
                     writer, sheet_name='월별구매량', index=False)
 
@@ -570,16 +592,16 @@ def main():
     st.sidebar.header("📝 사용 방법")
     st.sidebar.markdown("""
     1. **Excel 파일 업로드**: 재고 데이터가 포함된 Excel 파일을 업로드하세요.
-    2. **데이터 확인**: 업로드된 데이터를 확인하세요.
+    2. **발주 정보 입력**: 품목별 업체명·단가 등을 입력하세요. (기준정보 파일로 자동 채우기 가능)
     3. **계산 실행**: '계산 시작' 버튼을 클릭하세요.
-    4. **결과 확인**: 입고 계획과 발주서, 월별 구매량을 확인하세요.
+    4. **결과 확인**: 발주서·입고 계획·월별 구매량을 확인하세요.
     5. **복사/다운로드**: 발주서 탭에서 복사하거나 Excel로 다운로드하세요.
     """)
 
     st.sidebar.markdown("---")
-    st.sidebar.header("📋 필요한 열 정보")
+    st.sidebar.header("📋 필요한 열 정보 (업로드 파일)")
     st.sidebar.markdown("""
-    **필수 열 (재고 계산용):**
+    Excel 파일에는 다음 열이 포함되어야 합니다:
     - 원료코드명
     - 원료명
     - 현재 재고
@@ -591,13 +613,8 @@ def main():
     - 제외 날짜 (선택사항)
     - 포함 날짜 (선택사항)
 
-    **발주서 정보 열 (선택사항):**
-    - 부가세 구분
-    - 제품 구분
-    - 업체명
-    - 단량(KG)
-    - 단가(원)
-    - 담당자 이메일
+    발주 정보(업체명·단가 등)는 업로드 후
+    화면에서 직접 입력합니다.
     """)
 
     # 파일 업로드
@@ -629,7 +646,7 @@ def main():
             with col3:
                 st.metric("데이터 크기", f"{df.shape[0]} × {df.shape[1]}")
 
-            # 필수 열 확인
+            # 필수 열 확인 (기존 업로드 형식 그대로)
             required_columns = [
                 '원료코드명', '원료명', '현재 재고', '최소 사용량',
                 '최대 사용량', '계산 일자', '안전 재고', '1회 구매량'
@@ -643,15 +660,64 @@ def main():
             else:
                 st.success("✅ 모든 필수 열이 확인되었습니다!")
 
-            # 발주서용 정보 컬럼 확인 (없으면 빈 값으로 생성)
-            order_info_columns = ['부가세 구분', '제품 구분', '업체명', '단량(KG)', '단가(원)', '담당자 이메일']
-            missing_order_cols = [col for col in order_info_columns if col not in df.columns]
-            if missing_order_cols:
-                st.warning(f"⚠️ 발주 정보 열이 없어 빈 값으로 처리됩니다: {', '.join(missing_order_cols)}")
-                for col in missing_order_cols:
-                    df[col] = ''
+            # ─────────────────────────────────────────────
+            # 발주 정보 입력 (계산 시작 전 단계)
+            # ─────────────────────────────────────────────
+            st.markdown("---")
+            st.subheader("🧾 발주 정보 입력")
+            st.caption("품목별 부가세 구분·제품 구분·업체명·단량·단가·담당자 이메일을 입력하세요. "
+                       "발주서 출력에 그대로 사용됩니다. 총액은 입고량 × 단가로 자동 계산됩니다.")
 
-            # 계산 버튼
+            # 기준정보 파일로 자동 채우기 (선택사항)
+            prefill_file = st.file_uploader(
+                "기준정보 파일로 자동 채우기 (선택사항)",
+                type=['xlsx', 'xls'],
+                key="prefill_file",
+                help="'품목코드(또는 원료코드명)' 열과 업체명·담당자 이메일 등의 열이 있으면 품목코드 기준으로 자동으로 채워집니다."
+            )
+
+            prefill_df = None
+            if prefill_file is not None:
+                try:
+                    prefill_df = pd.read_excel(prefill_file)
+                except Exception as e:
+                    st.warning(f"⚠️ 기준정보 파일을 읽지 못했습니다: {str(e)}")
+
+            # 발주 정보 표 초기화 (재고 파일/기준정보 파일이 바뀔 때만 새로 생성)
+            editor_key = f"{uploaded_file.name}|{prefill_file.name if prefill_file else 'none'}"
+            if st.session_state.get('order_info_key') != editor_key:
+                st.session_state['order_info_base'] = build_order_info_base(df, prefill_df)
+                st.session_state['order_info_key'] = editor_key
+
+            order_info_df = st.data_editor(
+                st.session_state['order_info_base'],
+                use_container_width=True,
+                num_rows="fixed",
+                disabled=['원료코드명', '원료명'],
+                column_config={
+                    '원료코드명': st.column_config.TextColumn('원료코드명'),
+                    '원료명': st.column_config.TextColumn('원료명'),
+                    '부가세 구분': st.column_config.TextColumn('부가세 구분', help="예: 과세 / 면세"),
+                    '제품 구분': st.column_config.TextColumn('제품 구분'),
+                    '업체명': st.column_config.TextColumn('업체명'),
+                    '단량(KG)': st.column_config.NumberColumn('단량(KG)', min_value=0, format="%.2f"),
+                    '단가(원)': st.column_config.NumberColumn('단가(원)', min_value=0, format="%.0f"),
+                    '담당자 이메일': st.column_config.TextColumn('담당자 이메일'),
+                },
+                key=f"order_editor_{editor_key}"
+            )
+            # 편집 내용을 세션에 보관 (계산 후에도 유지)
+            st.session_state['order_info_base'] = order_info_df
+
+            # 입력 현황 요약
+            filled_price = int(pd.to_numeric(order_info_df['단가(원)'], errors='coerce').notna().sum())
+            filled_vendor = int(order_info_df['업체명'].astype(str).str.strip().ne('').sum())
+            st.caption(f"입력 현황 — 단가: {filled_price}/{len(order_info_df)}개, 업체명: {filled_vendor}/{len(order_info_df)}개 "
+                       "(비워두면 발주서에서 해당 칸이 빈 값으로 출력됩니다)")
+
+            # ─────────────────────────────────────────────
+            # 날짜 설정
+            # ─────────────────────────────────────────────
             st.markdown("---")
             st.subheader("📅 날짜 설정 (선택사항)")
 
@@ -668,11 +734,9 @@ def main():
                 st.markdown("**🚫 제외할 날짜들**")
                 st.caption("계산에서 제외할 날짜를 추가하세요 (휴일, 비가동일 등)")
 
-                # 날짜 범위 설정
                 today = datetime.now().date()
                 max_date = today + timedelta(days=365)
 
-                # 제외 날짜 추가
                 exclude_date_input = st.date_input(
                     "제외할 날짜 선택",
                     value=today,
@@ -695,7 +759,6 @@ def main():
                         st.session_state.exclude_dates_list = []
                         st.success("모든 제외 날짜가 삭제되었습니다.")
 
-                # 추가된 제외 날짜 목록 표시
                 if st.session_state.exclude_dates_list:
                     st.write("**추가된 제외 날짜들:**")
                     for i, date in enumerate(sorted(st.session_state.exclude_dates_list)):
@@ -714,7 +777,6 @@ def main():
                 st.markdown("**✅ 포함할 날짜들**")
                 st.caption("주말이지만 가동하는 날짜를 추가하세요")
 
-                # 포함 날짜 추가
                 include_date_input = st.date_input(
                     "포함할 날짜 선택",
                     value=today,
@@ -738,7 +800,6 @@ def main():
                         st.session_state.include_dates_list = []
                         st.success("모든 포함 날짜가 삭제되었습니다.")
 
-                # 추가된 포함 날짜 목록 표시
                 if st.session_state.include_dates_list:
                     st.write("**추가된 포함 날짜들:**")
                     for i, date in enumerate(sorted(st.session_state.include_dates_list)):
@@ -777,8 +838,8 @@ def main():
             if results:
                 st.success("✅ 계산이 완료되었습니다!")
 
-                # 발주서/월별 데이터 준비
-                po_df = create_purchase_order_df(results, df)
+                # 발주서/월별 데이터 준비 (발주 정보는 최신 입력값 반영)
+                po_df = create_purchase_order_df(results, df, order_info_df)
                 monthly_df = calculate_monthly_purchase(results, df)
 
                 # 탭으로 결과 구분
@@ -796,9 +857,10 @@ def main():
                         # 단가 미입력 안내
                         missing_price = int(po_df['총액(원)'].astype(str).eq('').sum())
                         if missing_price:
-                            st.warning(f"⚠️ 단가 미입력으로 총액을 계산하지 못한 행이 {missing_price}건 있습니다.")
+                            st.warning(f"⚠️ 단가 미입력으로 총액을 계산하지 못한 행이 {missing_price}건 있습니다. "
+                                       "위 '발주 정보 입력' 표에서 단가를 채우면 즉시 반영됩니다.")
 
-                        # 발주 총액 요약
+                        # 발주 요약
                         total_sum = pd.to_numeric(po_df['총액(원)'], errors='coerce').sum()
                         sum_col1, sum_col2 = st.columns(2)
                         with sum_col1:
@@ -806,7 +868,8 @@ def main():
                         with sum_col2:
                             st.metric("발주 총액(원)", f"{total_sum:,.0f}")
 
-                        st.markdown("**📋 아래 박스 우측 상단의 복사 버튼을 눌러 발주서 생성창에 그대로 붙여넣으세요.** (탭 구분 형식이라 Excel/그리드에 열이 맞춰 들어갑니다)")
+                        st.markdown("**📋 아래 박스 우측 상단의 복사 버튼을 눌러 발주서 생성창에 그대로 붙여넣으세요.** "
+                                    "(탭 구분 형식이라 Excel/그리드에 열이 맞춰 들어갑니다)")
                         include_header = st.checkbox("헤더(열 이름) 포함", value=True, key="po_header")
                         tsv_text = po_df.to_csv(sep='\t', index=False, header=include_header)
                         st.code(tsv_text, language=None)
@@ -864,7 +927,6 @@ def main():
                 with tab4:
                     st.subheader("📅 입고 일정 요약")
 
-                    # 입고 일정 달력 형태로 표시
                     all_purchase_dates = []
                     for item in results:
                         if item['입고 필요일'] != '입고 필요 없음':
@@ -884,7 +946,6 @@ def main():
 
                         st.dataframe(schedule_df, use_container_width=True)
 
-                        # 날짜별 입고 품목 수
                         date_counts = schedule_df['날짜'].value_counts().sort_index()
                         st.bar_chart(date_counts)
                     else:
@@ -898,7 +959,6 @@ def main():
                 st.markdown("---")
                 st.subheader("💾 결과 다운로드")
 
-                # Excel 파일 생성
                 try:
                     excel_file = create_excel_file(results, monthly_df, po_df)
 
@@ -914,7 +974,6 @@ def main():
                         st.error("Excel 파일 생성에 실패했습니다.")
                 except Exception as e:
                     st.error(f"다운로드 파일 생성 중 오류: {str(e)}")
-                    # 대안: CSV 파일 다운로드 제공
                     st.info("대신 CSV 파일로 다운로드하시겠습니까?")
                     csv = po_df.to_csv(index=False, encoding='utf-8-sig')
                     st.download_button(
@@ -931,7 +990,7 @@ def main():
     else:
         st.info("👆 Excel 파일을 업로드해주세요.")
 
-        # 샘플 데이터 표시
+        # 샘플 데이터 표시 (기존 업로드 형식 그대로)
         st.subheader("📋 샘플 데이터 형식")
         sample_data = {
             '원료코드명': ['1010101', '1010111'],
@@ -943,13 +1002,7 @@ def main():
             '안전 재고': [20, 15],
             '1회 구매량': [100, 80],
             '제외 날짜': ['2026-07-15', ''],
-            '포함 날짜': ['', '2026-07-18'],
-            '부가세 구분': ['면세', '과세'],
-            '제품 구분': ['원료', '원료'],
-            '업체명': ['주식회사 도명트레이딩', '(주)가온트레이딩'],
-            '단량(KG)': [20, 25],
-            '단가(원)': [3500, 12000],
-            '담당자 이메일': ['dohmyung2022@naver.com', 'donghyun0910@gaontrading.com']
+            '포함 날짜': ['', '2026-07-18']
         }
         sample_df = pd.DataFrame(sample_data)
         st.dataframe(sample_df, use_container_width=True)
