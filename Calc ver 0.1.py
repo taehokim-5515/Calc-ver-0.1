@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import altair as alt
 from datetime import datetime, timedelta
 from pathlib import Path
 import calendar
@@ -308,142 +309,158 @@ def display_calendar(results_data, receipt_events=None):
         if rows:
             st.dataframe(pd.DataFrame(rows).sort_values('날짜'), width='stretch')
 
+def to_date_set(dates):
+    """date/datetime 목록을 date 집합으로 변환"""
+    result = set()
+    for d in dates or []:
+        if d is None:
+            continue
+        result.add(d.date() if isinstance(d, datetime) else d)
+    return result
+
+def simulate_item(row, exclude_dates, include_dates, item_receipts, auto_order=True):
+    """한 품목의 일자별 재고를 시뮬레이션하는 함수
+    - 입고 예정: 가동일 여부와 상관없이 그날 시작 시점에 재고 반영
+    - 가동일(평일 또는 포함일, 제외일 아님)에만 안전재고 점검 및 사용량 차감
+    - auto_order=False 이면 자동 발주 없이 입고 예정만 반영한 재고 추이를 계산
+    """
+    current_inventory = float(row['현재 재고'])
+    daily_usage = (float(row['최소 사용량']) + float(row['최대 사용량'])) / 2
+    calculation_days = int(row['계산 일자'])
+    safety_stock = float(row['안전 재고'])
+    purchase_amount = float(row['1회 구매량'])
+
+    start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = start_date + timedelta(days=calculation_days)
+
+    remaining_inventory = current_inventory
+    orders, applied_receipts, review_notes, daily = [], [], [], []
+    out_of_range = sum(1 for d in item_receipts if not (start_date.date() <= d <= end_date.date()))
+
+    current_date = start_date
+    while current_date <= end_date:
+        day = current_date.date()
+
+        received = item_receipts.get(day, 0.0)
+        if received:
+            remaining_inventory += received
+            applied_receipts.append((day, received))
+
+        is_included_date = day in include_dates
+        is_working_day = (not is_weekend(current_date) or is_included_date) and day not in exclude_dates
+
+        ordered = 0.0
+        if is_working_day:
+            if auto_order and remaining_inventory <= safety_stock:
+                # 주말 가동일(포함일)에 도달하면 다음 월요일을 입고일로 표기
+                actual_purchase_date = (
+                    get_next_monday(current_date) if is_included_date and is_weekend(current_date)
+                    else current_date
+                )
+
+                # 아직 도착하지 않은 입고 예정이 있는데 그 전에 안전재고에 도달한 경우
+                pending = [d for d in item_receipts if day < d <= end_date.date()]
+                if pending:
+                    review_notes.append(
+                        f"{actual_purchase_date:%Y-%m-%d} 발주 ← {min(pending):%Y-%m-%d} 입고예정 전 안전재고 도달"
+                    )
+
+                orders.append({
+                    'reach_date': current_date.strftime('%Y-%m-%d'),
+                    'purchase_date': actual_purchase_date.strftime('%Y-%m-%d'),
+                    'stock_before': f"{remaining_inventory:.2f}",
+                    'stock_after': f"{remaining_inventory + purchase_amount:.2f}"
+                })
+                remaining_inventory += purchase_amount
+                ordered = purchase_amount
+
+            remaining_inventory -= daily_usage
+
+        daily.append({'날짜': day, '재고': remaining_inventory, '발주량': ordered,
+                      '입고예정량': received, '가동일': is_working_day})
+        current_date += timedelta(days=1)
+
+    return {
+        'orders': orders,
+        'applied_receipts': applied_receipts,
+        'review_notes': review_notes,
+        'daily': daily,
+        'out_of_range': out_of_range,
+        'safety_stock': safety_stock,
+    }
+
 def calculate_purchase_date(df, web_exclude_dates=None, web_include_dates=None, scheduled_receipts=None):
     """안전재고 도달일과 입고 필요일을 계산하는 함수
-    scheduled_receipts: {원료코드: {date: 입고량(KG)}} — 해당 일자 시작 시점에 재고로 반영
-    반환: (품목별 결과 리스트, 반영된 입고 예정 목록)
+    scheduled_receipts: {원료코드: {date: 입고량(KG)}}
+    반환: (품목별 결과 리스트, 반영된 입고 예정 목록, 일자별 재고 DataFrame)
     """
     try:
         results = []
         receipt_events = []
+        daily_rows = []
         scheduled_receipts = scheduled_receipts or {}
 
-        # 웹에서 입력받은 날짜를 datetime 객체로 변환
-        web_exclude_datetimes = []
-        if web_exclude_dates:
-            if isinstance(web_exclude_dates, (list, tuple)):
-                web_exclude_datetimes = [datetime.combine(date, datetime.min.time()) for date in web_exclude_dates]
-            else:
-                web_exclude_datetimes = [datetime.combine(web_exclude_dates, datetime.min.time())]
-
-        web_include_datetimes = []
-        if web_include_dates:
-            if isinstance(web_include_dates, (list, tuple)):
-                web_include_datetimes = [datetime.combine(date, datetime.min.time()) for date in web_include_dates]
-            else:
-                web_include_datetimes = [datetime.combine(web_include_dates, datetime.min.time())]
+        if web_exclude_dates is not None and not isinstance(web_exclude_dates, (list, tuple, set)):
+            web_exclude_dates = [web_exclude_dates]
+        if web_include_dates is not None and not isinstance(web_include_dates, (list, tuple, set)):
+            web_include_dates = [web_include_dates]
+        web_exclude = to_date_set(web_exclude_dates)
+        web_include = to_date_set(web_include_dates)
 
         for _, row in df.iterrows():
-            # 기본 데이터 추출
             item_code = row['원료코드명']
             item_name = row['원료명']
-            current_inventory = float(row['현재 재고'])
-            daily_usage = (float(row['최소 사용량']) + float(row['최대 사용량'])) / 2
-            calculation_days = int(row['계산 일자'])
-            safety_stock = float(row['안전 재고'])
-            purchase_amount = float(row['1회 구매량'])
 
-            # 시작일 설정
-            start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            end_date = start_date + timedelta(days=calculation_days)
-
-            # Excel 파일의 제외 날짜 처리 (열이 없어도 동작)
-            excel_exclude_dates = []
+            # Excel 파일의 제외/포함 날짜 (열이 없어도 동작) + 웹 입력 날짜
+            excel_exclude, excel_include = [], []
             if pd.notna(row.get('제외 날짜')):
-                date_strings = str(row.get('제외 날짜')).split(',')
-                excel_exclude_dates = [parse_date(date_str) for date_str in date_strings if parse_date(date_str)]
-
-            # Excel 파일의 포함 날짜 처리 (열이 없어도 동작)
-            excel_include_dates = []
+                excel_exclude = [parse_date(s) for s in str(row.get('제외 날짜')).split(',') if parse_date(s)]
             if pd.notna(row.get('포함 날짜')):
-                date_strings = str(row.get('포함 날짜')).split(',')
-                excel_include_dates = [parse_date(date_str) for date_str in date_strings if parse_date(date_str)]
+                excel_include = [parse_date(s) for s in str(row.get('포함 날짜')).split(',') if parse_date(s)]
+            exclude_dates = web_exclude | to_date_set(excel_exclude)
+            include_dates = web_include | to_date_set(excel_include)
 
-            # 최종 제외/포함 날짜 결합 (웹 입력이 우선, Excel 데이터와 합침)
-            final_exclude_dates = web_exclude_datetimes + excel_exclude_dates
-            final_include_dates = web_include_datetimes + excel_include_dates
-
-            # 이 품목의 입고 예정
             item_receipts = scheduled_receipts.get(normalize_code(item_code), {})
-            out_of_range = sum(1 for d in item_receipts if not (start_date.date() <= d <= end_date.date()))
-            applied_receipts = []
-            review_notes = []
 
-            # 안전재고 도달일 계산
-            current_date = start_date
-            remaining_inventory = current_inventory
-            safety_stock_info = []
+            sim = simulate_item(row, exclude_dates, include_dates, item_receipts, auto_order=True)
+            sim_no_order = simulate_item(row, exclude_dates, include_dates, item_receipts, auto_order=False)
 
-            while current_date <= end_date:
-                day = current_date.date()
+            for day, qty in sim['applied_receipts']:
+                receipt_events.append({
+                    '날짜': f"{day:%Y-%m-%d}",
+                    '품목코드': item_code,
+                    '품목명': item_name,
+                    '입고량(KG)': qty,
+                })
 
-                # 입고 예정: 가동일 여부와 상관없이 그날 시작 시점에 재고 반영
-                if day in item_receipts:
-                    qty = item_receipts[day]
-                    remaining_inventory += qty
-                    applied_receipts.append(f"{day:%Y-%m-%d}({qty:,.0f}kg)")
-                    receipt_events.append({
-                        '날짜': f"{day:%Y-%m-%d}",
-                        '품목코드': item_code,
-                        '품목명': item_name,
-                        '입고량(KG)': qty,
-                    })
+            for with_order, without_order in zip(sim['daily'], sim_no_order['daily']):
+                daily_rows.append({
+                    '품목코드': item_code,
+                    '품목명': item_name,
+                    '날짜': with_order['날짜'],
+                    '재고': round(with_order['재고'], 2),
+                    '재고(자동발주 제외)': round(without_order['재고'], 2),
+                    '안전재고': sim['safety_stock'],
+                    '발주량': with_order['발주량'],
+                    '입고예정량': with_order['입고예정량'],
+                    '가동일': with_order['가동일'],
+                })
 
-                # 주말이면서 포함 날짜에 없는 경우 스킵
-                is_included_date = any(include_date and include_date.date() == day
-                                    for include_date in final_include_dates)
-                if is_weekend(current_date) and not is_included_date:
-                    current_date += timedelta(days=1)
-                    continue
+            receipt_text = ', '.join(f"{d:%Y-%m-%d}({q:,.0f}kg)" for d, q in sim['applied_receipts']) or '-'
+            if sim['out_of_range']:
+                receipt_text += f" (계산기간 외 {sim['out_of_range']}건 미반영)"
+            review_text = ' / '.join(sim['review_notes']) if sim['review_notes'] else '-'
 
-                # 제외일인 경우 스킵
-                if any(exclude_date and exclude_date.date() == day
-                      for exclude_date in final_exclude_dates):
-                    current_date += timedelta(days=1)
-                    continue
-
-                # 재고가 안전재고 이하가 되는지 확인
-                if remaining_inventory <= safety_stock:
-                    # 포함일(주말)인 경우 다음 월요일을 입고일로 설정
-                    actual_purchase_date = (
-                        get_next_monday(current_date) if is_included_date
-                        else current_date
-                    )
-
-                    # 아직 도착하지 않은 입고 예정이 있는데 그 전에 안전재고에 도달한 경우
-                    pending = [d for d in item_receipts if day < d <= end_date.date()]
-                    if pending:
-                        review_notes.append(
-                            f"{actual_purchase_date:%Y-%m-%d} 발주 ← {min(pending):%Y-%m-%d} 입고예정 전 안전재고 도달"
-                        )
-
-                    safety_stock_info.append({
-                        'reach_date': current_date.strftime('%Y-%m-%d'),
-                        'purchase_date': actual_purchase_date.strftime('%Y-%m-%d'),
-                        'stock_before': f"{remaining_inventory:.2f}",
-                        'stock_after': f"{remaining_inventory + purchase_amount:.2f}"
-                    })
-                    remaining_inventory += purchase_amount
-
-                # 재고 계산
-                remaining_inventory -= daily_usage
-                current_date += timedelta(days=1)
-
-            receipt_text = ', '.join(applied_receipts) if applied_receipts else '-'
-            if out_of_range:
-                receipt_text += f" (계산기간 외 {out_of_range}건 미반영)"
-            review_text = ' / '.join(review_notes) if review_notes else '-'
-
-            # 결과 저장
-            if safety_stock_info:
+            orders = sim['orders']
+            if orders:
                 results.append({
                     '품목코드': item_code,
                     '품목명': item_name,
                     '입고 예정 반영': receipt_text,
-                    '안전재고 도달 일자': ', '.join(info['reach_date'] for info in safety_stock_info),
-                    '도달시 재고량': ', '.join(info['stock_before'] for info in safety_stock_info),
-                    '입고후 재고량': ', '.join(info['stock_after'] for info in safety_stock_info),
-                    '입고 필요일': ', '.join(info['purchase_date'] for info in safety_stock_info),
+                    '안전재고 도달 일자': ', '.join(o['reach_date'] for o in orders),
+                    '도달시 재고량': ', '.join(o['stock_before'] for o in orders),
+                    '입고후 재고량': ', '.join(o['stock_after'] for o in orders),
+                    '입고 필요일': ', '.join(o['purchase_date'] for o in orders),
                     '검토 필요': review_text,
                 })
             else:
@@ -458,11 +475,133 @@ def calculate_purchase_date(df, web_exclude_dates=None, web_include_dates=None, 
                     '검토 필요': review_text,
                 })
 
-        return results, receipt_events
+        return results, receipt_events, pd.DataFrame(daily_rows)
 
     except Exception as e:
         st.error(f"계산 중 에러 발생: {str(e)}")
-        return None, []
+        return None, [], pd.DataFrame()
+
+def render_stock_chart(daily_df, results):
+    """품목별 일자별 재고 추이 그래프"""
+    if daily_df is None or daily_df.empty:
+        st.info("일자별 재고 데이터가 없습니다. '계산 시작'을 다시 눌러주세요.")
+        return
+
+    labels = [f"{normalize_code(r['품목코드'])} | {r['품목명']}" for r in results]
+    label_to_code = {label: normalize_code(r['품목코드']) for label, r in zip(labels, results)}
+
+    # 기본 선택: 검토 필요 품목 → 발주 필요 품목 → 첫 품목
+    default_index = next((i for i, r in enumerate(results) if r['검토 필요'] != '-'),
+                         next((i for i, r in enumerate(results) if r['입고 필요일'] != '입고 필요 없음'), 0))
+
+    sel_col, opt_col = st.columns([3, 2])
+    with sel_col:
+        selected = st.selectbox("품목 선택", labels, index=default_index, key="chart_item")
+    with opt_col:
+        st.write("")
+        show_no_order = st.checkbox("자동 발주 없을 때 재고도 함께 보기", value=True, key="chart_no_order",
+                                    help="입고 예정만 반영하고 자동 발주를 하지 않았을 때의 재고 추이 (점선)")
+
+    item = daily_df[daily_df['품목코드'].map(normalize_code) == label_to_code[selected]].copy()
+    item['날짜'] = pd.to_datetime(item['날짜'])
+    safety_stock = float(item['안전재고'].iloc[0])
+
+    # 요약 지표
+    min_row = item.loc[item['재고'].idxmin()]
+    receipt_days = item.loc[item['입고예정량'] > 0, '날짜']
+    stockout = item[item['재고(자동발주 제외)'] <= 0]
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("자동 발주 횟수", f"{int((item['발주량'] > 0).sum())}회")
+    with m2:
+        st.metric("최저 재고 (발주 반영)", f"{min_row['재고']:,.0f}kg",
+                  help=f"{min_row['날짜']:%Y-%m-%d} 기준")
+    with m3:
+        if receipt_days.empty:
+            st.metric("입고 예정 기간 최저 재고", "입고 예정 없음")
+        else:
+            # 마지막 입고 예정 전날까지, 자동 발주 없이 입고 예정만으로 버틸 때의 최저 재고
+            window = item[item['날짜'] < receipt_days.max()]
+            if window.empty:
+                st.metric("입고 예정 기간 최저 재고", "-")
+            else:
+                low = window.loc[window['재고(자동발주 제외)'].idxmin()]
+                st.metric("입고 예정 기간 최저 재고 (자동 발주 없이)",
+                          f"{low['재고(자동발주 제외)']:,.0f}kg",
+                          delta=f"{low['재고(자동발주 제외)'] - safety_stock:+,.0f}kg (안전재고 대비)",
+                          help=f"{low['날짜']:%Y-%m-%d} 기준. 마지막 입고 예정일({receipt_days.max():%Y-%m-%d}) 전까지 "
+                               "추가 발주 없이 입고 예정 물량만으로 버틸 때의 최저 재고입니다.")
+    with m4:
+        st.metric("재고 소진 예상일 (자동 발주 없이)",
+                  f"{stockout['날짜'].iloc[0]:%Y-%m-%d}" if not stockout.empty else "계산기간 내 없음",
+                  help="추가 발주 없이 입고 예정 물량만 들어올 때 재고가 0 이하가 되는 첫 날")
+
+    # 재고선 (실선: 발주 반영, 점선: 자동 발주 없이)
+    value_vars = ['재고', '재고(자동발주 제외)'] if show_no_order else ['재고']
+    line_names = {'재고': '재고 (자동 발주 반영)', '재고(자동발주 제외)': '재고 (자동 발주 없이)'}
+    long_df = item.melt(id_vars=['날짜'], value_vars=value_vars, var_name='구분', value_name='재고량')
+    long_df['구분'] = long_df['구분'].map(line_names)
+
+    line_domain = list(line_names.values())
+    x_domain = [item['날짜'].min().strftime('%Y-%m-%d'), item['날짜'].max().strftime('%Y-%m-%d')]
+    lines = alt.Chart(long_df).mark_line(strokeWidth=2).encode(
+        x=alt.X('날짜:T', title=None, scale=alt.Scale(domain=x_domain, nice=False),
+                axis=alt.Axis(format='%Y-%m-%d', labelAngle=-30)),
+        y=alt.Y('재고량:Q', title='재고 (KG)', axis=alt.Axis(format=',.0f')),
+        color=alt.Color('구분:N', title=None,
+                        scale=alt.Scale(domain=line_domain, range=['#6366F1', '#9CA3AF']),
+                        legend=alt.Legend(orient='top')),
+        strokeDash=alt.StrokeDash('구분:N', scale=alt.Scale(domain=line_domain, range=[[1, 0], [6, 4]]), legend=None),
+        tooltip=[alt.Tooltip('날짜:T', format='%Y-%m-%d (%a)'), alt.Tooltip('구분:N'),
+                 alt.Tooltip('재고량:Q', format=',.2f', title='재고(KG)')],
+    )
+
+    # 안전재고선
+    safety_df = pd.DataFrame({'안전재고': [safety_stock], 'label': [f"안전재고 {safety_stock:,.0f}kg"]})
+    safety_rule = alt.Chart(safety_df).mark_rule(color='#F59E0B', strokeDash=[4, 4], strokeWidth=2).encode(
+        y='안전재고:Q', tooltip=[alt.Tooltip('label:N', title='기준')])
+    safety_text = alt.Chart(safety_df).mark_text(align='right', dx=-4, dy=-7, color='#F59E0B', fontSize=11).encode(
+        x=alt.value(alt.expr('width')), y='안전재고:Q', text='label:N')
+
+    # 자동 발주 / 입고 예정 지점
+    events = []
+    for _, r in item.iterrows():
+        if r['발주량'] > 0:
+            events.append({'날짜': r['날짜'], '재고량': r['재고'], '이벤트': '자동 발주', '수량': r['발주량']})
+        if r['입고예정량'] > 0:
+            events.append({'날짜': r['날짜'], '재고량': r['재고'], '이벤트': '입고 예정', '수량': r['입고예정량']})
+
+    layers = [lines, safety_rule, safety_text]
+    if events:
+        points = alt.Chart(pd.DataFrame(events)).mark_point(filled=True, size=110, opacity=1).encode(
+            x='날짜:T',
+            y='재고량:Q',
+            color=alt.Color('이벤트:N', title=None,
+                            scale=alt.Scale(domain=['자동 발주', '입고 예정'], range=['#EF4444', '#3B82F6']),
+                            legend=alt.Legend(orient='top')),
+            shape=alt.Shape('이벤트:N', scale=alt.Scale(domain=['자동 발주', '입고 예정'],
+                                                      range=['triangle-up', 'diamond']), legend=None),
+            tooltip=[alt.Tooltip('날짜:T', format='%Y-%m-%d (%a)'), alt.Tooltip('이벤트:N'),
+                     alt.Tooltip('수량:Q', format=',.0f', title='수량(KG)'),
+                     alt.Tooltip('재고량:Q', format=',.2f', title='당일 마감 재고(KG)')],
+        )
+        layers.append(points)
+
+    chart = (alt.layer(*layers)
+             .resolve_scale(color='independent', shape='independent', strokeDash='independent')
+             .properties(height=420)
+             .interactive(bind_y=False))
+    st.altair_chart(chart, use_container_width=True)
+    st.caption("재고는 하루 마감 기준(입고·발주 반영 후 당일 사용량 차감)입니다. "
+               "그래프를 드래그하면 기간 이동, 스크롤하면 확대/축소, 더블클릭하면 원래대로 돌아갑니다.")
+
+    with st.expander("📄 일자별 재고 표"):
+        table = item[['날짜', '가동일', '입고예정량', '발주량', '재고', '재고(자동발주 제외)']].copy()
+        table['날짜'] = table['날짜'].dt.strftime('%Y-%m-%d') + table['날짜'].dt.weekday.map(lambda w: f" ({WEEKDAYS_KR[w]})")
+        table['가동일'] = table['가동일'].map({True: '가동', False: '휴무'})
+        st.dataframe(table, width='stretch', hide_index=True)
+
 
 def calculate_monthly_purchase(results_data, df):
     """월별 구매 필요량을 계산하는 함수"""
@@ -675,7 +814,7 @@ def create_calendar_sheet_safe(writer, results_data, receipt_events=None):
             calendar_sheet = workbook.create_sheet('입고일정달력')
             calendar_sheet.cell(row=1, column=1, value=f"달력 생성 중 오류 발생: {str(e)}")
 
-def create_excel_file(results_data, monthly_df, po_df, receipt_events=None):
+def create_excel_file(results_data, monthly_df, po_df, receipt_events=None, daily_stock_df=None):
     """엑셀 파일을 메모리에 생성하여 반환"""
     output = io.BytesIO()
 
@@ -695,6 +834,14 @@ def create_excel_file(results_data, monthly_df, po_df, receipt_events=None):
             if receipt_events:
                 pd.DataFrame(receipt_events).sort_values('날짜').to_excel(
                     writer, sheet_name='입고예정', index=False)
+
+            # 일자별재고 시트 (행: 날짜, 열: 품목, 값: 하루 마감 재고)
+            if daily_stock_df is not None and not daily_stock_df.empty:
+                pivot_src = daily_stock_df.assign(
+                    품목=daily_stock_df['품목명'].astype(str) + '(' + daily_stock_df['품목코드'].map(normalize_code) + ')')
+                pivot = pivot_src.pivot_table(index='날짜', columns='품목', values='재고', aggfunc='last', sort=False)
+                pivot.index = pd.to_datetime(pivot.index).strftime('%Y-%m-%d')
+                pivot.to_excel(writer, sheet_name='일자별재고')
 
             # 월별구매량 시트
             if not monthly_df.empty:
@@ -1091,7 +1238,7 @@ def main():
 
             if st.button("🚀 계산 시작", type="primary", width='stretch'):
                 with st.spinner("계산 중입니다... 잠시만 기다려주세요."):
-                    results, receipt_events = calculate_purchase_date(
+                    results, receipt_events, daily_stock_df = calculate_purchase_date(
                         df,
                         st.session_state.exclude_dates_list,
                         st.session_state.include_dates_list,
@@ -1100,6 +1247,7 @@ def main():
                     if results:
                         st.session_state['results'] = results
                         st.session_state['receipt_events'] = receipt_events
+                        st.session_state['daily_stock'] = daily_stock_df
                         st.session_state['results_file'] = uploaded_file.name
                         st.session_state['calc_signature'] = calc_signature
                     else:
@@ -1119,8 +1267,12 @@ def main():
                 po_df = create_purchase_order_df(results, df, order_info_df, vendor_map)
                 monthly_df = calculate_monthly_purchase(results, df)
 
-                tab1, tab2, tab3, tab4, tab5 = st.tabs(
-                    ["🧾 발주서", "📋 입고 계획", "📊 월별 구매량", "📅 입고 일정 요약", "🗓️ 캘린더 보기"])
+                tab1, tab_chart, tab2, tab3, tab4, tab5 = st.tabs(
+                    ["🧾 발주서", "📈 재고 추이", "📋 입고 계획", "📊 월별 구매량", "📅 입고 일정 요약", "🗓️ 캘린더 보기"])
+
+                with tab_chart:
+                    st.subheader("📈 일자별 재고 추이")
+                    render_stock_chart(st.session_state.get('daily_stock'), results)
 
                 with tab1:
                     st.subheader("🧾 발주서 출력 (생성창 규격)")
@@ -1247,7 +1399,8 @@ def main():
                 st.subheader("💾 결과 다운로드")
 
                 try:
-                    excel_file = create_excel_file(results, monthly_df, po_df, receipt_events)
+                    excel_file = create_excel_file(results, monthly_df, po_df, receipt_events,
+                                                   st.session_state.get('daily_stock'))
 
                     if excel_file is not None:
                         st.download_button(
