@@ -323,6 +323,8 @@ def simulate_item(row, exclude_dates, include_dates, item_receipts, auto_order=T
     - 입고 예정: 가동일 여부와 상관없이 그날 시작 시점에 재고 반영
     - 가동일(평일 또는 포함일, 제외일 아님)에만 안전재고 점검 및 사용량 차감
     - auto_order=False 이면 자동 발주 없이 입고 예정만 반영한 재고 추이를 계산
+    - 수기 입고 예정이 있으면 마지막 수기 입고일 전날까지는 자동 발주를 넣지 않고(수기 계획 우선),
+      그 구간의 안전재고 미달·결품은 경고로만 기록
     """
     current_inventory = float(row['현재 재고'])
     daily_usage = (float(row['최소 사용량']) + float(row['최대 사용량'])) / 2
@@ -336,6 +338,11 @@ def simulate_item(row, exclude_dates, include_dates, item_receipts, auto_order=T
     remaining_inventory = current_inventory
     orders, applied_receipts, review_notes, daily = [], [], [], []
     out_of_range = sum(1 for d in item_receipts if not (start_date.date() <= d <= end_date.date()))
+    in_range_receipts = [d for d in item_receipts if start_date.date() <= d <= end_date.date()]
+    manual_until = max(in_range_receipts) if in_range_receipts else None
+
+    shortage = None        # 진행 중인 안전재고 미달 구간 {'start', 'end', 'min'}
+    stockout_date = None   # 수기 계획 구간 중 재고가 0 이하가 되는 첫 날
 
     current_date = start_date
     while current_date <= end_date:
@@ -348,22 +355,16 @@ def simulate_item(row, exclude_dates, include_dates, item_receipts, auto_order=T
 
         is_included_date = day in include_dates
         is_working_day = (not is_weekend(current_date) or is_included_date) and day not in exclude_dates
+        in_manual_window = manual_until is not None and day < manual_until
 
         ordered = 0.0
         if is_working_day:
-            if auto_order and remaining_inventory <= safety_stock:
+            if auto_order and not in_manual_window and remaining_inventory <= safety_stock:
                 # 주말 가동일(포함일)에 도달하면 다음 월요일을 입고일로 표기
                 actual_purchase_date = (
                     get_next_monday(current_date) if is_included_date and is_weekend(current_date)
                     else current_date
                 )
-
-                # 아직 도착하지 않은 입고 예정이 있는데 그 전에 안전재고에 도달한 경우
-                pending = [d for d in item_receipts if day < d <= end_date.date()]
-                if pending:
-                    review_notes.append(
-                        f"{actual_purchase_date:%Y-%m-%d} 발주 ← {min(pending):%Y-%m-%d} 입고예정 전 안전재고 도달"
-                    )
 
                 orders.append({
                     'reach_date': current_date.strftime('%Y-%m-%d'),
@@ -376,12 +377,32 @@ def simulate_item(row, exclude_dates, include_dates, item_receipts, auto_order=T
 
             remaining_inventory -= daily_usage
 
+        # 수기 계획 구간의 안전재고 미달 구간·결품 기록
+        if in_manual_window and remaining_inventory < safety_stock:
+            if shortage is None:
+                shortage = {'start': day, 'end': day, 'min': remaining_inventory}
+            shortage['end'] = day
+            shortage['min'] = min(shortage['min'], remaining_inventory)
+            if remaining_inventory <= 0 and stockout_date is None:
+                stockout_date = day
+        elif shortage is not None:
+            review_notes.append(f"{shortage['start']:%Y-%m-%d}~{shortage['end']:%Y-%m-%d} "
+                                f"안전재고 미달 (최저 {shortage['min']:,.0f}kg)")
+            shortage = None
+
         daily.append({'날짜': day, '재고': remaining_inventory, '발주량': ordered,
-                      '입고예정량': received, '가동일': is_working_day})
+                      '입고예정량': received, '가동일': is_working_day, '수기계획구간': in_manual_window})
         current_date += timedelta(days=1)
+
+    if shortage is not None:
+        review_notes.append(f"{shortage['start']:%Y-%m-%d}~{shortage['end']:%Y-%m-%d} "
+                            f"안전재고 미달 (최저 {shortage['min']:,.0f}kg)")
+    if stockout_date is not None:
+        review_notes.insert(0, f"⛔ {stockout_date:%Y-%m-%d} 결품 예상")
 
     return {
         'orders': orders,
+        'manual_until': manual_until,
         'applied_receipts': applied_receipts,
         'review_notes': review_notes,
         'daily': daily,
@@ -444,9 +465,12 @@ def calculate_purchase_date(df, web_exclude_dates=None, web_include_dates=None, 
                     '발주량': with_order['발주량'],
                     '입고예정량': with_order['입고예정량'],
                     '가동일': with_order['가동일'],
+                    '수기계획구간': with_order['수기계획구간'],
                 })
 
             receipt_text = ', '.join(f"{d:%Y-%m-%d}({q:,.0f}kg)" for d, q in sim['applied_receipts']) or '-'
+            if sim['manual_until']:
+                receipt_text += f" → {sim['manual_until']:%Y-%m-%d} 전까지 자동 발주 보류"
             if sim['out_of_range']:
                 receipt_text += f" (계산기간 외 {sim['out_of_range']}건 미반영)"
             review_text = ' / '.join(sim['review_notes']) if sim['review_notes'] else '-'
@@ -518,20 +542,17 @@ def render_stock_chart(daily_df, results):
         st.metric("최저 재고 (발주 반영)", f"{min_row['재고']:,.0f}kg",
                   help=f"{min_row['날짜']:%Y-%m-%d} 기준")
     with m3:
-        if receipt_days.empty:
-            st.metric("입고 예정 기간 최저 재고", "입고 예정 없음")
+        window = item[item['수기계획구간']]
+        if window.empty:
+            st.metric("수기 계획 구간 최저 재고", "수기 입고 없음")
         else:
-            # 마지막 입고 예정 전날까지, 자동 발주 없이 입고 예정만으로 버틸 때의 최저 재고
-            window = item[item['날짜'] < receipt_days.max()]
-            if window.empty:
-                st.metric("입고 예정 기간 최저 재고", "-")
-            else:
-                low = window.loc[window['재고(자동발주 제외)'].idxmin()]
-                st.metric("입고 예정 기간 최저 재고 (자동 발주 없이)",
-                          f"{low['재고(자동발주 제외)']:,.0f}kg",
-                          delta=f"{low['재고(자동발주 제외)'] - safety_stock:+,.0f}kg (안전재고 대비)",
-                          help=f"{low['날짜']:%Y-%m-%d} 기준. 마지막 입고 예정일({receipt_days.max():%Y-%m-%d}) 전까지 "
-                               "추가 발주 없이 입고 예정 물량만으로 버틸 때의 최저 재고입니다.")
+            # 마지막 수기 입고일 전날까지(자동 발주 보류 구간)의 최저 재고
+            low = window.loc[window['재고'].idxmin()]
+            st.metric("수기 계획 구간 최저 재고",
+                      f"{low['재고']:,.0f}kg",
+                      delta=f"{low['재고'] - safety_stock:+,.0f}kg (안전재고 대비)",
+                      help=f"{low['날짜']:%Y-%m-%d} 기준. 마지막 수기 입고일({receipt_days.max():%Y-%m-%d}) 전까지는 "
+                           "자동 발주 없이 수기 입고 예정 물량만으로 운영합니다.")
     with m4:
         st.metric("재고 소진 예상일 (자동 발주 없이)",
                   f"{stockout['날짜'].iloc[0]:%Y-%m-%d}" if not stockout.empty else "계산기간 내 없음",
@@ -545,8 +566,9 @@ def render_stock_chart(daily_df, results):
 
     line_domain = list(line_names.values())
     x_domain = [item['날짜'].min().strftime('%Y-%m-%d'), item['날짜'].max().strftime('%Y-%m-%d')]
+    x_scale = alt.Scale(domain=x_domain, nice=False)
     lines = alt.Chart(long_df).mark_line(strokeWidth=2).encode(
-        x=alt.X('날짜:T', title=None, scale=alt.Scale(domain=x_domain, nice=False),
+        x=alt.X('날짜:T', title=None, scale=x_scale,
                 axis=alt.Axis(format='%Y-%m-%d', labelAngle=-30)),
         y=alt.Y('재고량:Q', title='재고 (KG)', axis=alt.Axis(format=',.0f')),
         color=alt.Color('구분:N', title=None,
@@ -573,9 +595,18 @@ def render_stock_chart(daily_df, results):
             events.append({'날짜': r['날짜'], '재고량': r['재고'], '이벤트': '입고 예정', '수량': r['입고예정량']})
 
     layers = [lines, safety_rule, safety_text]
+
+    # 수기 입고 계획 구간 (자동 발주 보류) 음영
+    manual_days = item.loc[item['수기계획구간'], '날짜']
+    if not manual_days.empty:
+        band_df = pd.DataFrame({'시작': [manual_days.min()], '끝': [manual_days.max() + pd.Timedelta(days=1)],
+                                'label': ['수기 입고 계획 구간 (자동 발주 보류)']})
+        band = alt.Chart(band_df).mark_rect(color='#3B82F6', opacity=0.08).encode(
+            x=alt.X('시작:T', scale=x_scale), x2='끝:T', tooltip=[alt.Tooltip('label:N', title='구간')])
+        layers.insert(0, band)
     if events:
         points = alt.Chart(pd.DataFrame(events)).mark_point(filled=True, size=110, opacity=1).encode(
-            x='날짜:T',
+            x=alt.X('날짜:T', scale=x_scale),
             y='재고량:Q',
             color=alt.Color('이벤트:N', title=None,
                             scale=alt.Scale(domain=['자동 발주', '입고 예정'], range=['#EF4444', '#3B82F6']),
@@ -594,6 +625,7 @@ def render_stock_chart(daily_df, results):
              .interactive(bind_y=False))
     st.altair_chart(chart, use_container_width=True)
     st.caption("재고는 하루 마감 기준(입고·발주 반영 후 당일 사용량 차감)입니다. "
+               "파란 음영은 수기 입고 계획 구간으로, 이 구간에는 자동 발주를 넣지 않습니다. "
                "그래프를 드래그하면 기간 이동, 스크롤하면 확대/축소, 더블클릭하면 원래대로 돌아갑니다.")
 
     with st.expander("📄 일자별 재고 표"):
@@ -1308,9 +1340,10 @@ def main():
 
                     review_items = [r for r in results if r['검토 필요'] != '-']
                     if review_items:
-                        with st.expander(f"⚠️ 검토 필요 {len(review_items)}개 품목 — 입고 예정 전에 안전재고 도달", expanded=True):
-                            st.caption("입고 예정 물량이 도착하기 전에 안전재고에 닿아 추가 발주가 산출된 품목입니다. "
-                                       "예정 입고를 그 날짜 이전으로 당길 수 있다면 추가 발주가 필요 없을 수 있습니다.")
+                        with st.expander(f"⚠️ 검토 필요 {len(review_items)}개 품목 — 수기 입고 계획 구간 중 안전재고 미달", expanded=True):
+                            st.caption("수기로 입력한 입고 예정이 우선이라, 마지막 수기 입고일 전까지는 자동 발주를 넣지 않습니다. "
+                                       "그 구간에서 재고가 안전재고 아래로 내려가는 품목입니다. "
+                                       "⛔ 결품 예상이 있으면 입고 예정을 앞당기거나 물량을 늘려야 합니다.")
                             for r in review_items:
                                 st.write(f"• **{r['품목명']}** ({r['품목코드']}): {r['검토 필요']}")
 
